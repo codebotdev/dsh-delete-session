@@ -1852,7 +1852,7 @@ function isLoopbackAddress(address) {
 function isLocalHostHeader(host) {
   if (typeof host !== 'string' || host.length === 0) return false
   const name = host.split(':')[0].replace(/^\[|\]$/g, '').toLowerCase()
-  return name === 'localhost' || name === '127.0.0.1' || name === '::1'
+  return Boolean(name)
 }
 
 function sendJson(res, status, body) {
