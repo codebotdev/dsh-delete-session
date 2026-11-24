@@ -188,6 +188,12 @@ function walk(root) {
 }
 
 function matches(node, selector) {
+  // A comma list is an OR in the DOM, and the plugin uses one to find the
+  // "new session" button. Without this the stub silently answered "no match"
+  // for every alternative, which hid the fallback path entirely.
+  if (selector.includes(',')) {
+    return selector.split(',').some((part) => matches(node, part.trim()))
+  }
   // `:scope > .dsdel-check` - a DIRECT child. The plugin uses this to tell its
   // own row checkbox apart from anything nested, so depth has to be respected.
   const scoped = /^:scope > \.([\w-]+)$/.exec(selector)
@@ -199,6 +205,23 @@ function matches(node, selector) {
 
   if (selector.startsWith('.') && !selector.includes(':') && !selector.includes('[')) {
     return node._classes.has(selector.slice(1))
+  }
+
+  // `button[class*="newSession"]` - tag-qualified, used by the fallback that
+  // finds the host's "new session" button after a delete.
+  const tagClassContains = /^([A-Za-z][\w-]*)\[class\*="([^"]*)"\]$/.exec(selector)
+  if (tagClassContains !== null) {
+    if (String(node.tagName || '').toLowerCase() !== tagClassContains[1].toLowerCase()) return false
+    return String(node.className ?? '').includes(tagClassContains[2])
+  }
+
+  // `button[aria-label*="New session" i]` - a case-insensitive attribute match.
+  const tagAttrContains = /^([A-Za-z][\w-]*)\[([\w-]+)\*="([^"]*)"(?: i)?\]$/.exec(selector)
+  if (tagAttrContains !== null) {
+    if (String(node.tagName || '').toLowerCase() !== tagAttrContains[1].toLowerCase()) return false
+    const value = node.attributes[tagAttrContains[2]]
+    if (typeof value !== 'string') return false
+    return value.toLowerCase().includes(tagAttrContains[3].toLowerCase())
   }
 
   // `[class*="_footArea"]` - how the bar finds the host's sidebar footer.
@@ -233,6 +256,12 @@ let bundleFactory = null
 // next one can drop the leftovers.
 const rafQueues = []
 
+// Timers started by a plugin instance outlive the test that started them. The
+// batch path schedules a 2.5 s settle, and its callback decorates whatever
+// `globalThis.document` is when it fires - the next test's DOM. Track and
+// clear them so one test cannot reach into another.
+const pendingTimers = []
+
 /**
  * The bundle registers through `window.__ModuleLoader__` once per process and ESM
  * caching means a second `import()` never re-runs it. Caching the factory is also
@@ -251,6 +280,8 @@ async function loadPlugin(options = {}) {
   const document = {
     body: new StubElement('body'),
     head: new StubElement('head'),
+    // Read when the host provides no locale service at all.
+    documentElement: new StubElement('html'),
     createElement: (tag) => new StubElement(tag),
     addEventListener(type, handler) {
       const list = documentListeners.get(type) ?? []
@@ -317,6 +348,13 @@ async function loadPlugin(options = {}) {
   // very regression this file exists to catch.
   // Drop anything an earlier instance queued: it would run against THIS dom.
   for (const stale of rafQueues) stale.clear()
+  while (pendingTimers.length > 0) clearTimeout(pendingTimers.pop())
+  const realSetTimeout = globalThis.setTimeout
+  globalThis.setTimeout = (fn, ms) => {
+    const id = realSetTimeout(fn, ms)
+    pendingTimers.push(id)
+    return id
+  }
   let rafId = 0
   const rafQueue = new Map()
   rafQueues.push(rafQueue)
@@ -386,6 +424,11 @@ async function loadPlugin(options = {}) {
   const locales = {}
   const localeStub = {
     register: (namespace, dictionaries) => { locales[namespace] = dictionaries },
+    // `dsh-client-locale` exposes `getSnapshot() -> { active }`. The plugin follows
+    // it instead of `navigator.language`, so an English OS with DSH in Chinese no
+    // longer renders an English plugin (issue #3).
+    getSnapshot: () => ({ active: options.activeLocale ?? 'zh', locales: [], revision: 0 }),
+    subscribe: () => () => {},
     // Mirrors dsh-client-locale: a non-string entry is handed back untouched, and
     // only string templates interpolate `{name}` from a params object. Returning
     // a function as-is is exactly what makes the plugin fall back to its own
@@ -436,11 +479,18 @@ async function loadPlugin(options = {}) {
       if (name === 'slots') return slotsStub
       // `lateLocale` models a host where the locale service is only reachable
       // through ctx.inject, which is the path that used to skip registration.
-      if (name === 'locale') return options.lateLocale ? null : localeStub
+      if (name === 'locale') return (options.lateLocale || options.noLocale) ? null : localeStub
+      if (name === 'uiWorkspace') return options.noNavigation ? null : (options.navigation || null)
       return null
     },
     inject: (names, cb) => {
-      if (typeof cb === 'function') cb(options.lateLocale ? { slots: slotsStub, locale: localeStub } : { slots: slotsStub })
+      if (typeof cb === 'function') {
+        const late = options.lateLocale && !options.noLocale
+        const bag = { slots: slotsStub }
+        if (late) bag.locale = localeStub
+        if (options.navigation && !options.noNavigation) bag.uiWorkspace = options.navigation
+        cb(bag)
+      }
     },
     effect: (fn) => { const dispose = fn(); return () => { if (typeof dispose === 'function') dispose() } },
   })
@@ -498,6 +548,51 @@ function mountRow(harness, session = SESSION_A, parent = null) {
 
 const menuEntry = (harness, id) =>
   harness.slotRegistrations.find((entry) => entry.spec.name === MENU_SLOT && entry.spec.id === id) ?? null
+
+/** The batch checklist overlay, rendered the way the host renders it. */
+const batchPlanEntry = (harness) =>
+  harness.slotRegistrations.find((entry) => entry.spec.name === 'shell.overlay'
+    && entry.spec.id === NS + '-batchplan') ?? null
+
+const batchPlan = (harness) => {
+  const entry = batchPlanEntry(harness)
+  if (entry === null) return null
+  return entry.Component({ t: harness.t })
+}
+
+const childList = (node) => {
+  if (node === null || node === undefined || node.props === undefined) return []
+  const children = node.props.children
+  if (children === null || children === undefined) return []
+  return Array.isArray(children) ? children.filter(Boolean) : [children]
+}
+
+/** Every file row the checklist renders, as `{ path, input }`. */
+function batchFileRows(harness) {
+  const modal = batchPlan(harness)
+  if (modal === null) return []
+  const rows = []
+  for (const node of childList(modal)) {
+    if (node.props === undefined || node.props['data-file-row'] === undefined) continue
+    const label = childList(node).find((child) => child.type === 'label')
+    const input = label === undefined
+      ? null
+      : childList(label).find((child) => child.props && child.props.type === 'checkbox')
+    rows.push({ path: node.props['data-file-row'], input: input ?? null })
+  }
+  return rows
+}
+
+/** Invoke one footer button of the checklist. */
+function clickBatchPlan(harness, key) {
+  const modal = batchPlan(harness)
+  if (modal === null) return false
+  const footer = (modal.props.footer ?? []).filter(Boolean)
+  const button = footer.find((node) => node.props && node.props.key === key)
+  if (button === undefined) return false
+  button.props.onClick()
+  return true
+}
 
 const overlayEntry = (harness) =>
   harness.slotRegistrations.find((entry) => entry.spec.name === 'shell.overlay') ?? null
@@ -710,19 +805,20 @@ test('the Russian dictionary ships with every key the other dictionaries carry',
   assert.deepEqual(keys(en), keys(zh), 'en still covers the zh key set')
 })
 
-test('a Russian browser gets Russian labels from the built-in dictionary', async () => {
-  const harness = await loadPlugin()
+test('an English OS with DSH in Chinese renders Chinese (issue #3)', async () => {
+  const harness = await loadPlugin({ activeLocale: 'zh' })
   const previous = globalThis.navigator
   Object.defineProperty(globalThis, 'navigator', {
-    value: { language: 'ru-RU', languages: ['ru-RU'] },
+    value: { language: 'en-US', languages: ['en-US'] },
     configurable: true,
     writable: true,
   })
   try {
-    // The host translator in this harness answers in zh; the rows must prefer the
-    // plugin's own Russian dictionary instead of following it.
-    assert.equal(deleteRow(harness).element.props.children, 'Удалить сессию')
-    assert.equal(selectRow(harness).element.props.children, 'Выбрать несколько')
+    // The reported bug: the OS is English, the user set DSH to 中文, and the plugin
+    // still answered in English because it read `navigator.language`. The host is
+    // the authority now, so the browser language must not win.
+    assert.equal(deleteRow(harness).element.props.children, '删除会话')
+    assert.equal(selectRow(harness).element.props.children, '多选')
   } finally {
     Object.defineProperty(globalThis, 'navigator', {
       value: previous,
@@ -730,6 +826,73 @@ test('a Russian browser gets Russian labels from the built-in dictionary', async
       writable: true,
     })
   }
+})
+
+test('a Chinese OS with DSH in English renders English', async () => {
+  const harness = await loadPlugin({ activeLocale: 'en' })
+  const previous = globalThis.navigator
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { language: 'zh-CN', languages: ['zh-CN'] },
+    configurable: true,
+    writable: true,
+  })
+  try {
+    assert.equal(deleteRow(harness).element.props.children, 'Delete session')
+    assert.equal(selectRow(harness).element.props.children, 'Select multiple')
+  } finally {
+    Object.defineProperty(globalThis, 'navigator', {
+      value: previous,
+      configurable: true,
+      writable: true,
+    })
+  }
+})
+
+test('a host language we do not ship falls back to English', async () => {
+  const harness = await loadPlugin({ activeLocale: 'ja' })
+
+  // DSH knows ja/es/fr/de/pt as well. Those have no dictionary here, and the host
+  // would answer in English for them, so the plugin does too instead of silently
+  // dropping to Chinese (which is what the old browser-based fallback did).
+  assert.equal(deleteRow(harness).element.props.children, 'Delete session')
+})
+
+test('with no locale service the document hint decides', async () => {
+  const harness = await loadPlugin({ lateLocale: true, noLocale: true })
+  harness.document.documentElement.lang = 'ru'
+
+  // `dsh-client-locale` mirrors its choice onto `<html lang>`. A host that never
+  // hands over the service still leaves that behind, so it is read next.
+  assert.equal(deleteRow(harness).element.props.children, 'Удалить сессию')
+})
+
+test('with neither hint the browser language is the last resort', async () => {
+  const harness = await loadPlugin({ noLocale: true })
+  const previous = globalThis.navigator
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { language: 'ru-RU', languages: ['ru-RU'] },
+    configurable: true,
+    writable: true,
+  })
+  try {
+    // Pre-#3 behaviour, kept as the floor: something has to answer when the host
+    // provides nothing at all.
+    assert.equal(deleteRow(harness).element.props.children, 'Удалить сессию')
+  } finally {
+    Object.defineProperty(globalThis, 'navigator', {
+      value: previous,
+      configurable: true,
+      writable: true,
+    })
+  }
+})
+test('a Russian DSH gets Russian labels from the built-in dictionary', async () => {
+  const harness = await loadPlugin({ activeLocale: 'ru' })
+
+  // The host translator in this harness answers in zh; the rows must prefer the
+  // plugin's own Russian dictionary instead of following it.
+  assert.equal(deleteRow(harness).element.props.children, 'Удалить сессию')
+  assert.equal(selectRow(harness).element.props.children, 'Выбрать несколько')
 })
 
 test('the delete row asks the host for its danger styling', async () => {
@@ -783,6 +946,134 @@ test('shift-click forces the dialog even after asking was turned off', async () 
 
 // --- the regression ---------------------------------------------------------
 
+test('deleting the current session clears the main view instead of opening a new one (issue #5)', async () => {
+  let cleared = 0
+  const harness = await loadPlugin({
+    navigation: { clearMain: () => { cleared += 1 } },
+  })
+  mountRow(harness, SESSION_A)
+  localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: SESSION_A.id }))
+
+  // The host's own session menu row drives the delete; asking is off so it goes
+  // straight through, like the reporter did.
+  localStorage.setItem(SKIP_KEY, '1')
+  const { element } = deleteRow(harness)
+  element.props.onSelect({ shiftKey: false })
+  await tick()
+  await flush()
+
+  // Issue #5: this used to click the sidebar's "new session" button, which every
+  // plugin that intercepts session creation shares (a naming dialog, a template
+  // picker). Deleting a conversation must not create one.
+  assert.equal(cleared, 1, 'the host was told to drop the main reference')
+  assert.equal(harness.requests.filter((c) => c.url === '/dsh-delete-session/delete').length, 1, 'the delete still went out')
+})
+
+test('a delete that is not the current session leaves navigation alone', async () => {
+  let cleared = 0
+  const harness = await loadPlugin({
+    navigation: { clearMain: () => { cleared += 1 } },
+  })
+  mountRow(harness, SESSION_A)
+  localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: SESSION_B.id }))
+  localStorage.setItem(SKIP_KEY, '1')
+
+  const { element } = deleteRow(harness)
+  element.props.onSelect({ shiftKey: false })
+  await tick()
+  await flush()
+
+  assert.equal(cleared, 0, 'nothing to clear: the deleted one was not on screen')
+})
+
+test('with no navigation service the sidebar button is the last resort', async () => {
+  const harness = await loadPlugin({ noNavigation: true })
+  mountRow(harness, SESSION_A)
+  localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: SESSION_A.id }))
+  localStorage.setItem(SKIP_KEY, '1')
+
+  // A host that predates `clearMain` still has to end up with no current
+  // conversation, so the old fallback stays. It is only reached when the service
+  // is genuinely absent.
+  let clicked = 0
+  const btn = harness.document.createElement('button')
+  btn.className = 'newSession'
+  btn.click = () => { clicked += 1 }
+  harness.document.body.appendChild(btn)
+
+  const { element } = deleteRow(harness)
+  element.props.onSelect({ shiftKey: false })
+  await tick()
+  await flush()
+
+  assert.equal(clicked, 1, 'the fallback still runs without the service')
+})
+test('by default a delete of the open conversation opens a fresh one', async () => {
+  const calls = []
+  const harness = await loadPlugin({
+    navigation: {
+      startSession: () => { calls.push('startSession') },
+      clearMain: () => { calls.push('clearMain') },
+    },
+  })
+  mountRow(harness, SESSION_A)
+  localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: SESSION_A.id }))
+  localStorage.setItem(SKIP_KEY, '1')
+
+  const { element } = deleteRow(harness)
+  element.props.onSelect({ shiftKey: false })
+  await tick()
+  await flush()
+
+  assert.deepEqual(calls, ['startSession'], 'one fresh conversation, nothing cleared')
+})
+
+test('turning the switch off leaves the view blank instead', async () => {
+  const calls = []
+  const harness = await loadPlugin({
+    navigation: {
+      startSession: () => { calls.push('startSession') },
+      clearMain: () => { calls.push('clearMain') },
+    },
+  })
+  localStorage.setItem('dsh-delete-session:replace-current', '0')
+  mountRow(harness, SESSION_A)
+  localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: SESSION_A.id }))
+  localStorage.setItem(SKIP_KEY, '1')
+
+  const { element } = deleteRow(harness)
+  element.props.onSelect({ shiftKey: false })
+  await tick()
+  await flush()
+
+  assert.deepEqual(calls, ['clearMain'], 'the switch is a real choice')
+})
+
+test('a host without startSession still ends up with a blank view', async () => {
+  const calls = []
+  const harness = await loadPlugin({
+    navigation: { clearMain: () => { calls.push('clearMain') } },
+  })
+  mountRow(harness, SESSION_A)
+  localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: SESSION_A.id }))
+  localStorage.setItem(SKIP_KEY, '1')
+
+  const { element } = deleteRow(harness)
+  element.props.onSelect({ shiftKey: false })
+  await tick()
+  await flush()
+
+  assert.deepEqual(calls, ['clearMain'], 'no fresh session available, so clear')
+})
+
+test('the replace-current switch renders on the plugin page', async () => {
+  const harness = await loadPlugin()
+  const card = pageCard(harness)
+  const fields = (card.props.children ?? []).filter((node) => node && node.props && node.props.className === 'dsdel-field')
+
+  // Five switches: ask / recycle / syncChildren / replaceCurrent / artifacts.
+  assert.ok(fields.length >= 5, 'the new switch became its own block, saw ' + fields.length)
+})
 test('a single delete plants no checkbox on any row (the v0.1.8 regression)', async () => {
   const harness = await loadPlugin()
   mountRow(harness, SESSION_A)
@@ -1176,7 +1467,7 @@ test('the produced-files feature ships off: no scan, no section, no quarantine f
 
 test('the page hides the artifact sub-controls while the master switch is on', async () => {
   const harness = await loadPlugin()
-  assert.equal(pageChecks(harness).length, 4, 'ask, recycle, subagents and the master switch render')
+  assert.equal(pageChecks(harness).length, 5, 'ask, recycle, subagents, replace-current and the master switch render')
   assert.equal(offCheckbox(harness).props.checked, true, 'the master switch starts ticked')
 })
 
@@ -1185,7 +1476,7 @@ test('clearing the master switch reveals the auto and scope controls', async () 
   offCheckbox(harness).props.onChange(false)
 
   assert.equal(localStorage.getItem(OFF_KEY), '0', 'the opt-in was stored')
-  assert.equal(pageChecks(harness).length, 8, 'the sub-controls render once enabled')
+  assert.equal(pageChecks(harness).length, 9, 'the sub-controls render once enabled')
   assert.equal(autoCheckbox(harness).props.checked, false, 'asking is the default once enabled')
   assert.equal(scopeCreatedCheckbox(harness).props.checked, true, 'created-only is the default scope')
   assert.equal(scopeAllCheckbox(harness).props.checked, false)
@@ -3578,4 +3869,198 @@ test('a workspace box never reaches into a nested workspace', async () => {
 
   const box = header.querySelector('.dsdel-select-all')
   assert.deepEqual(box.__dsdelIds, [SESSION_A.id], 'only the outer group\'s own session')
+})
+
+test('multi-select delete carries the artifact switch to every request', async () => {
+  const harness = await loadPlugin({ plan: PLAN })
+  localStorage.setItem(OFF_KEY, '0')
+  localStorage.setItem(AUTO_KEY, '1')
+  localStorage.setItem(SKIP_KEY, '1')
+  const first = mountRow(harness, SESSION_A)
+  const second = mountRow(harness, SESSION_B)
+  await enterMulti(harness)
+  clickRowIn(harness, first)
+  clickRowIn(harness, second)
+  await flush()
+
+  clickBar(barDelete(harness))
+  // The batch runs several workers and settles asynchronously; waiting only one
+  // tick left them running into the NEXT test, whose harness swapped the document
+  // out from under them. Drain until the bar is gone.
+  await settle()
+  for (let i = 0; i < 40 && bar(harness) !== null; i += 1) await flush()
+
+  // The single-delete path sends `quarantine`; batch used to call postDelete(id)
+  // with nothing, so "quarantine the produced files" was silently skipped while
+  // that same switch stayed on. Every request here has to carry it.
+  const bodies = harness.requests
+    .filter((call) => call.url === '/dsh-delete-session/delete')
+    .map((call) => JSON.parse(call.init.body))
+  assert.equal(bodies.length, 2, 'one request per selected session')
+  for (const body of bodies) {
+    assert.deepEqual(body.quarantine, { scope: 'created' }, 'the produced files follow the switch')
+  }
+})
+
+test('multi-select delete leaves the files alone when the switch is off', async () => {
+  const harness = await loadPlugin()
+  const first = mountRow(harness, SESSION_A)
+  await enterMulti(harness)
+  clickRowIn(harness, first)
+  await flush()
+
+  clickBar(barDelete(harness))
+  await settle()
+  for (let i = 0; i < 40 && bar(harness) !== null; i += 1) await flush()
+
+  const bodies = harness.requests
+    .filter((call) => call.url === '/dsh-delete-session/delete')
+    .map((call) => JSON.parse(call.init.body))
+  assert.equal(bodies.length, 1, 'the delete went out')
+  assert.equal('quarantine' in bodies[0], false, 'and does not move any file')
+})
+
+test('a batch in asking mode opens a checklist instead of deleting straight away', async () => {
+  const harness = await loadPlugin()
+  localStorage.setItem(OFF_KEY, '0')
+  localStorage.setItem(AUTO_KEY, '0')
+  const first = mountRow(harness, SESSION_A)
+  await enterMulti(harness)
+  clickRowIn(harness, first)
+  await flush()
+
+  clickBar(barDelete(harness))
+  await settle()
+
+  // Issue #4: asking mode must show a list. It used to delete first and only say
+  // afterwards that the files had been left alone.
+  assert.equal(deleteCalls(harness), 0, 'nothing deleted before the user confirmed')
+  assert.ok(batchPlan(harness) !== null, 'the checklist opened')
+})
+
+test('the batch checklist lists every selected session and its files', async () => {
+  const harness = await loadPlugin({ plan: PLAN })
+  localStorage.setItem(OFF_KEY, '0')
+  localStorage.setItem(AUTO_KEY, '0')
+  const first = mountRow(harness, SESSION_A)
+  const second = mountRow(harness, SESSION_B)
+  await enterMulti(harness)
+  clickRowIn(harness, first)
+  clickRowIn(harness, second)
+  await flush()
+
+  clickBar(barDelete(harness))
+  await settle()
+
+  // The checklist covers the whole selection, not just whichever session happened
+  // to be first: the stub answers every scan with the same PLAN, so two sessions
+  // with two created files each make four rows.
+  const rows = batchFileRows(harness)
+  assert.equal(rows.length, 4, 'two sessions, two files each, saw ' + rows.length)
+})
+
+test('confirming the checklist sends each session its own file list', async () => {
+  const harness = await loadPlugin()
+  localStorage.setItem(OFF_KEY, '0')
+  localStorage.setItem(AUTO_KEY, '0')
+  const first = mountRow(harness, SESSION_A)
+  await enterMulti(harness)
+  clickRowIn(harness, first)
+  await flush()
+  clickBar(barDelete(harness))
+  await settle()
+
+  assert.equal(clickBatchPlan(harness, 'confirm'), true, 'the checklist has a confirm')
+  await settle()
+  for (let i = 0; i < 40 && bar(harness) !== null; i += 1) await flush()
+
+  // `paths` is the whole point: the host intersects it with its own derived set,
+  // so sending it can only narrow the move, never widen it.
+  const body = deleteBody(harness)
+  assert.ok(body, 'a delete went out')
+  assert.ok(body.quarantine, 'the delete carries a quarantine plan')
+  assert.ok(Array.isArray(body.quarantine.paths), 'and an explicit file list')
+})
+
+test('unticking a file keeps it out of the request', async () => {
+  const harness = await loadPlugin({ plan: PLAN })
+  localStorage.setItem(OFF_KEY, '0')
+  localStorage.setItem(AUTO_KEY, '0')
+  const first = mountRow(harness, SESSION_A)
+  await enterMulti(harness)
+  clickRowIn(harness, first)
+  await flush()
+  clickBar(barDelete(harness))
+  await settle()
+
+  const rows = batchFileRows(harness)
+  assert.ok(rows.length >= 1, 'the fixture has at least one file')
+  // Untick through the input the user would click, not through store internals.
+  rows[0].input.props.onChange({ target: { checked: false } })
+  await flush()
+
+  // The box itself has to show the new state: a checkbox that stays ticked while
+  // the file is no longer in the request is a lie about what will happen.
+  const after = batchFileRows(harness)
+  assert.equal(after[0].input.props.checked, false, 'the unticked row renders unticked')
+
+  assert.equal(clickBatchPlan(harness, 'confirm'), true)
+  await settle()
+  for (let i = 0; i < 40 && bar(harness) !== null; i += 1) await flush()
+
+  const body = deleteBody(harness)
+  assert.equal(body.quarantine.paths.includes(rows[0].path), false, 'the unticked file stays put')
+})
+
+test('cancelling the checklist deletes nothing', async () => {
+  const harness = await loadPlugin()
+  localStorage.setItem(OFF_KEY, '0')
+  localStorage.setItem(AUTO_KEY, '0')
+  const first = mountRow(harness, SESSION_A)
+  await enterMulti(harness)
+  clickRowIn(harness, first)
+  await flush()
+  clickBar(barDelete(harness))
+  await settle()
+
+  assert.equal(clickBatchPlan(harness, 'cancel'), true, 'the checklist has a cancel')
+  await flush()
+
+  assert.equal(deleteCalls(harness), 0, 'no delete went out')
+  assert.equal(batchPlan(harness), null, 'and the dialog closed')
+})
+
+test('auto mode still deletes straight through, with no checklist', async () => {
+  const harness = await loadPlugin()
+  localStorage.setItem(OFF_KEY, '0')
+  localStorage.setItem(AUTO_KEY, '1')
+  localStorage.setItem(SKIP_KEY, '1')
+  const first = mountRow(harness, SESSION_A)
+  await enterMulti(harness)
+  clickRowIn(harness, first)
+  await flush()
+  clickBar(barDelete(harness))
+  await settle()
+  for (let i = 0; i < 40 && bar(harness) !== null; i += 1) await flush()
+
+  assert.equal(batchPlan(harness), null, 'no checklist in auto mode')
+  assert.equal(deleteCalls(harness), 1, 'the delete ran')
+  assert.deepEqual(deleteBody(harness).quarantine, { scope: 'created' }, 'the derived set, not a list')
+})
+
+test('the feature off deletes straight through too', async () => {
+  const harness = await loadPlugin()
+  localStorage.setItem(OFF_KEY, '1')
+  localStorage.setItem(SKIP_KEY, '1')
+  const first = mountRow(harness, SESSION_A)
+  await enterMulti(harness)
+  clickRowIn(harness, first)
+  await flush()
+  clickBar(barDelete(harness))
+  await settle()
+  for (let i = 0; i < 40 && bar(harness) !== null; i += 1) await flush()
+
+  assert.equal(batchPlan(harness), null, 'the dialog never opened')
+  assert.equal(deleteCalls(harness), 1, 'the delete ran')
+  assert.equal('quarantine' in deleteBody(harness), false, 'and touched no file')
 })
